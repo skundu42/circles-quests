@@ -42,6 +42,7 @@ A Circles quests/task-completion app with in-app actions and server-side verific
 - `SUPABASE_QUEST_COMPLETIONS_TABLE` (default: `quest_completions`)
 - `SUPABASE_QUEST_AUTH_CHALLENGES_TABLE` (default: `quest_auth_challenges`)
 - `QUEST_MIN_CONFIRMATIONS`
+- `QUEST_ENFORCE_TX_SENDER_MATCH` (default: `false`; set `true` only for direct-wallet tx mode)
 - `QUEST_SEND_MIN_CRC`
 - `QUEST_SEND_EXECUTION_CRC`
 - `QUEST_MUTUAL_TRUST_MIN`

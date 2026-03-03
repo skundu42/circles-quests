@@ -10,7 +10,7 @@ import {
   verifyTxAfterRoundStart
 } from "@backend/quests/chain";
 import { getCompletionByQuest, listCompletionsByDate, listCompletionsByDateAddress, upsertCompletion } from "./store";
-import { buildAddTrustAction, buildJoinGroupAction, buildPaymentAction } from "./tx-builder";
+import { buildAddTrustAction, buildMintGroupAction, buildPaymentAction } from "./tx-builder";
 import type {
   PreparedQuestAction,
   QuestCompletion,
@@ -23,6 +23,7 @@ import type {
 
 const DEFAULT_CIRCLES_RPC_URL = "https://rpc.aboutcircles.com/";
 const MIN_CONFIRMATIONS = Number(process.env.QUEST_MIN_CONFIRMATIONS || "1");
+const ENFORCE_TX_SENDER_MATCH = String(process.env.QUEST_ENFORCE_TX_SENDER_MATCH || "false").toLowerCase() === "true";
 
 const SEND_MIN_CRC = process.env.QUEST_SEND_MIN_CRC || "5";
 const SEND_EXECUTION_CRC = process.env.QUEST_SEND_EXECUTION_CRC || "5.1";
@@ -185,6 +186,10 @@ function parseAmountCRC(raw: unknown, fallback: string): string {
 
 function requiresOnchainProof(questId: QuestId): boolean {
   return questId === "add-trust" || questId === "send-5-crc" || questId === "mint-5-gcrc";
+}
+
+function expectedTxSender(address: Address): Address | undefined {
+  return ENFORCE_TX_SENDER_MATCH ? address : undefined;
 }
 
 function parseOptionalNonNegativeInteger(value: unknown): number | null {
@@ -555,41 +560,63 @@ async function findTransferForQuest(params: {
 
 async function findTransferForQuestToken(params: {
   txHash: string;
-  recipientAddress: Address;
+  memberAddress: Address;
   tokenAddress: Address;
   startAt: string;
 }): Promise<TransactionHistoryRow | null> {
   const rpc = getRpc();
-  const query = rpc.transaction.getTransactionHistory(params.recipientAddress, 100, "DESC");
   const minTimestamp = Math.floor(Date.parse(params.startAt) / 1000);
+  const expectedTxHash = normalizeAddress(params.txHash);
+  const expectedToken = normalizeAddress(params.tokenAddress);
+  const memberAddress = normalizeAddress(params.memberAddress);
 
-  let scanned = 0;
-  while (scanned < 10 && (await query.queryNextPage())) {
-    scanned += 1;
-    const rows = (query.currentPage?.results ?? []) as TransactionHistoryRow[];
+  const scanHistory = async (historyAddress: Address): Promise<TransactionHistoryRow | null> => {
+    const query = rpc.transaction.getTransactionHistory(historyAddress, 100, "DESC");
+    let scanned = 0;
 
-    for (const row of rows) {
-      if (normalizeAddress(row.transactionHash) !== normalizeAddress(params.txHash)) {
-        continue;
+    while (scanned < 10 && (await query.queryNextPage())) {
+      scanned += 1;
+      const rows = (query.currentPage?.results ?? []) as TransactionHistoryRow[];
+
+      for (const row of rows) {
+        if (normalizeAddress(row.transactionHash) !== expectedTxHash) {
+          continue;
+        }
+
+        if (Number(row.timestamp) < minTimestamp) {
+          continue;
+        }
+
+        if (normalizeAddress(row.tokenAddress) !== expectedToken) {
+          continue;
+        }
+
+        const from = normalizeAddress(row.from);
+        const to = normalizeAddress(row.to);
+        if (from !== memberAddress && to !== memberAddress) {
+          continue;
+        }
+
+        return row;
       }
 
-      if (Number(row.timestamp) < minTimestamp) {
-        continue;
+      if (!query.currentPage?.hasMore) {
+        break;
       }
-
-      if (normalizeAddress(row.tokenAddress) !== normalizeAddress(params.tokenAddress)) {
-        continue;
-      }
-
-      if (normalizeAddress(row.to) !== normalizeAddress(params.recipientAddress)) {
-        continue;
-      }
-
-      return row;
     }
 
-    if (!query.currentPage?.hasMore) {
-      break;
+    return null;
+  };
+
+  const fromMemberHistory = await scanHistory(params.memberAddress);
+  if (fromMemberHistory) {
+    return fromMemberHistory;
+  }
+
+  if (normalizeAddress(params.tokenAddress) !== memberAddress) {
+    const fromGroupHistory = await scanHistory(params.tokenAddress);
+    if (fromGroupHistory) {
+      return fromGroupHistory;
     }
   }
 
@@ -873,7 +900,7 @@ export async function prepareQuestAction(params: {
     return {
       questId: quest.id,
       summary: `Mint ${GCRC_MINT_AMOUNT_CRC} gCRC for group ${GCRC_GROUP_ADDRESS}`,
-      hostTransactions: await buildJoinGroupAction({
+      hostTransactions: await buildMintGroupAction({
         actorAddress: address,
         groupAddress: GCRC_GROUP_ADDRESS,
         amountCRC: GCRC_MINT_AMOUNT_CRC
@@ -939,7 +966,7 @@ export async function claimQuest(params: {
     if (needsTx && quest.id !== "mint-5-gcrc") {
       verifiedTx = await verifyTxAfterRoundStart({
         txHash,
-        expectedFrom: address,
+        expectedFrom: expectedTxSender(address),
         roundStartAt: window.startAt,
         minConfirmations: MIN_CONFIRMATIONS
       });
@@ -1028,87 +1055,35 @@ export async function claimQuest(params: {
       proof.bonusXp = bonusXp;
       proof.awardedXp = verified ? quest.xp + bonusXp : 0;
     } else if (quest.id === "mint-5-gcrc") {
-      const minAtto = parseUnits(GCRC_MINT_AMOUNT_CRC, 18);
-      let matchedTransfer:
-        | {
-            txHash: string;
-            source: "rpc_history";
-            amountAtto: bigint;
-            transferTimestamp?: number;
-            transferBlockNumber?: number;
-            transferFrom?: string;
-            transferTo?: string;
-          }
-        | null = null;
-      let lastFailureReason = "No qualifying gCRC mint transfer found for this transaction";
+      let verifiedTxForMint: Awaited<ReturnType<typeof verifyTxAfterRoundStart>> | null = null;
+      let lastFailureReason = "Mint transaction could not be verified yet. Please retry shortly.";
 
       for (const candidateHash of candidateTxHashes) {
-        let candidateVerifiedTx: Awaited<ReturnType<typeof verifyTxAfterRoundStart>>;
         try {
-          candidateVerifiedTx = await verifyTxAfterRoundStart({
+          const candidateVerifiedTx = await verifyTxAfterRoundStart({
             txHash: candidateHash,
-            expectedFrom: address,
+            expectedFrom: expectedTxSender(address),
             roundStartAt: window.startAt,
             minConfirmations: MIN_CONFIRMATIONS
           });
+
+          verifiedTxForMint = candidateVerifiedTx;
+          completionTxHash = candidateHash;
+          break;
         } catch (error) {
           lastFailureReason = humanizeVerificationError(error);
-          continue;
         }
-
-        const transfer = await findTransferForQuestToken({
-          txHash: candidateHash,
-          recipientAddress: address,
-          tokenAddress: GCRC_GROUP_ADDRESS,
-          startAt: window.startAt
-        });
-
-        if (transfer) {
-          const amountAtto = transfer.attoCircles ?? BigInt(transfer.value);
-          if (amountAtto < minAtto) {
-            lastFailureReason = `Mint amount is below ${GCRC_MINT_AMOUNT_CRC} gCRC`;
-            continue;
-          }
-
-          matchedTransfer = {
-            txHash: candidateHash,
-            source: "rpc_history",
-            amountAtto,
-            transferTimestamp: transfer.timestamp,
-            transferBlockNumber: transfer.blockNumber,
-            transferFrom: normalizeAddress(transfer.from),
-            transferTo: normalizeAddress(transfer.to)
-          };
-          verifiedTx = candidateVerifiedTx;
-          break;
-        }
-        lastFailureReason = "No qualifying gCRC mint transfer found for this transaction";
       }
 
-      if (!matchedTransfer) {
+      if (!verifiedTxForMint) {
         reason = lastFailureReason;
       } else {
         verified = true;
         reason = "ok";
-        completionTxHash = matchedTransfer.txHash;
         proof.groupAddress = GCRC_GROUP_ADDRESS;
-        proof.transferTokenAddress = GCRC_GROUP_ADDRESS;
-        proof.transferSource = matchedTransfer.source;
-        proof.transferAmountAttoCircles = matchedTransfer.amountAtto.toString();
-        proof.minRequiredAttoCircles = minAtto.toString();
-        proof.matchedTxHash = matchedTransfer.txHash;
-        if (typeof matchedTransfer.transferTimestamp === "number") {
-          proof.transferTimestamp = matchedTransfer.transferTimestamp;
-        }
-        if (typeof matchedTransfer.transferBlockNumber === "number") {
-          proof.transferBlockNumber = matchedTransfer.transferBlockNumber;
-        }
-        if (matchedTransfer.transferFrom) {
-          proof.transferFrom = matchedTransfer.transferFrom;
-        }
-        if (matchedTransfer.transferTo) {
-          proof.transferTo = matchedTransfer.transferTo;
-        }
+        proof.matchedTxHash = completionTxHash;
+        proof.tx = verifiedTxForMint;
+        proof.mintVerificationMode = "tx_success";
       }
     } else if (quest.id === "no-blacklisted-trusts") {
       const result = await verifyNoBlacklistedTrusts(address);

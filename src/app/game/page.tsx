@@ -157,6 +157,26 @@ export default function GamePage() {
     return draftInputs[activeQuest.id] ?? {};
   }, [activeQuest, draftInputs]);
 
+  const activeRejectedReason = useMemo(() => {
+    if (activeQuest?.completion?.status !== "rejected") {
+      return null;
+    }
+
+    return activeQuest.completion.rejectedReason || "Verification failed";
+  }, [activeQuest]);
+
+  const visibleQuestDetailError = useMemo(() => {
+    if (!questDetailError) {
+      return null;
+    }
+
+    if (activeRejectedReason && questDetailError === activeRejectedReason) {
+      return null;
+    }
+
+    return questDetailError;
+  }, [questDetailError, activeRejectedReason]);
+
   const setDraftField = useCallback((questId: string, fieldId: string, value: string) => {
     setDraftInputs((current) => ({
       ...current,
@@ -680,14 +700,14 @@ export default function GamePage() {
                   <div className="rounded-xl border border-ink/10 bg-white p-3 text-xs text-ink/75">
                     <p>XP: {activeQuest.xp}</p>
                     <p className="capitalize">Status: {activeQuest.status}</p>
-                    {activeQuest.completion?.status === "rejected" ? (
-                      <p className="mt-1 text-red-600">Reason: {activeQuest.completion.rejectedReason || "Verification failed"}</p>
+                    {activeRejectedReason ? (
+                      <p className="mt-1 text-red-600">Reason: {activeRejectedReason}</p>
                     ) : null}
                   </div>
 
-                  {questDetailError ? (
+                  {visibleQuestDetailError ? (
                     <p className="rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700">
-                      {questDetailError}
+                      {visibleQuestDetailError}
                     </p>
                   ) : null}
 

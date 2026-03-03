@@ -1,9 +1,14 @@
 import { Sdk } from "@aboutcircles/sdk";
+import { circlesConfig } from "@aboutcircles/sdk-core";
 import type { Address, TransactionRequest } from "@aboutcircles/sdk-types";
-import { createPublicClient, http, parseUnits } from "viem";
+import { createPublicClient, encodeFunctionData, http, parseAbi, parseUnits } from "viem";
 import { gnosis } from "viem/chains";
 
 const DEFAULT_CHAIN_RPC_URL = "https://rpc.aboutcircles.com/";
+const HUB_V2_ADDRESS = circlesConfig[100].v2HubAddress as Address;
+const HUB_V2_ABI = parseAbi([
+  "function groupMint(address _group, address[] _collateralAvatars, uint256[] _amounts, bytes _data)"
+]);
 
 function toHexValue(value: bigint): `0x${string}` {
   return `0x${value.toString(16)}`;
@@ -140,4 +145,30 @@ export async function buildJoinGroupAction(params: {
 
     await maybeWithGroupToken.groupToken.mint(params.groupAddress, amountAtto);
   });
+}
+
+export async function buildMintGroupAction(params: {
+  actorAddress: Address;
+  groupAddress: Address;
+  amountCRC: string;
+}): Promise<Array<{ to: string; data: `0x${string}`; value: `0x${string}` }>> {
+  const amountAtto = parseUnits(params.amountCRC, 18);
+
+  if (amountAtto <= 0n) {
+    throw new Error("amountCRC must be greater than zero.");
+  }
+
+  const data = encodeFunctionData({
+    abi: HUB_V2_ABI,
+    functionName: "groupMint",
+    args: [params.groupAddress, [params.actorAddress], [amountAtto], "0x"]
+  });
+
+  return [
+    {
+      to: HUB_V2_ADDRESS,
+      data,
+      value: "0x0"
+    }
+  ];
 }
