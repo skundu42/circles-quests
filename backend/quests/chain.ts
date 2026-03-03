@@ -12,6 +12,7 @@ export interface RoundWindow {
 export interface TxWindowVerification {
   txHash: string;
   blockNumber: number;
+  transactionIndex: number;
   blockTimestamp: number;
   from: string;
   to: string;
@@ -53,8 +54,16 @@ export function getPublicClient() {
   return cachedPublicClient;
 }
 
-export function normalizeAddress(value: string): string {
-  return value.trim().toLowerCase();
+export function normalizeAddress(value: unknown): string {
+  if (typeof value === "string") {
+    return value.trim().toLowerCase();
+  }
+
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  return String(value).trim().toLowerCase();
 }
 
 function toUtcDate(value: Date): string {
@@ -80,7 +89,7 @@ export function getRoundWindow(date?: string): RoundWindow {
 
 export async function verifyTxAfterRoundStart(params: {
   txHash: string;
-  expectedFrom: string;
+  expectedFrom?: string | string[];
   roundStartAt: string;
   minConfirmations?: number;
 }): Promise<TxWindowVerification> {
@@ -99,16 +108,22 @@ export async function verifyTxAfterRoundStart(params: {
   const startAtSeconds = Math.floor(Date.parse(params.roundStartAt) / 1000);
   const blockTimestamp = Number(block.timestamp);
   const blockNumber = Number(receipt.blockNumber);
+  const transactionIndex = Number(receipt.transactionIndex);
 
   if (blockTimestamp < startAtSeconds) {
     throw new Error("Transaction is older than round start time");
   }
 
-  const expectedFrom = normalizeAddress(params.expectedFrom);
   const txFrom = normalizeAddress(tx.from);
 
-  if (txFrom !== expectedFrom) {
-    throw new Error("Transaction sender does not match authenticated user");
+  if (params.expectedFrom) {
+    const allowedSenders = (Array.isArray(params.expectedFrom) ? params.expectedFrom : [params.expectedFrom]).map(
+      (address) => normalizeAddress(address)
+    );
+
+    if (!allowedSenders.includes(txFrom)) {
+      throw new Error("Transaction sender does not match authenticated user");
+    }
   }
 
   const latest = await client.getBlockNumber();
@@ -120,6 +135,7 @@ export async function verifyTxAfterRoundStart(params: {
   return {
     txHash,
     blockNumber,
+    transactionIndex,
     blockTimestamp,
     from: txFrom,
     to: normalizeAddress(tx.to ?? "0x0000000000000000000000000000000000000000")

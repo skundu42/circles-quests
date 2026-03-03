@@ -1,6 +1,5 @@
 import { Sdk } from "@aboutcircles/sdk";
 import type { Address, TransactionRequest } from "@aboutcircles/sdk-types";
-import { cidV0ToHex } from "@aboutcircles/sdk-utils";
 import { createPublicClient, http, parseUnits } from "viem";
 import { gnosis } from "viem/chains";
 
@@ -25,19 +24,6 @@ function chainRpcUrl(): string {
     process.env.NEXT_PUBLIC_CIRCLES_RPC_URL ||
     DEFAULT_CHAIN_RPC_URL
   );
-}
-
-function createGroupSymbol(name: string): string {
-  const alnum = name
-    .replace(/[^a-zA-Z0-9]/g, "")
-    .toUpperCase()
-    .slice(0, 6);
-
-  if (alnum.length >= 3) {
-    return alnum;
-  }
-
-  return `${alnum}GRP`.slice(0, 3);
 }
 
 async function collectHostTransactions(
@@ -153,89 +139,5 @@ export async function buildJoinGroupAction(params: {
     }
 
     await maybeWithGroupToken.groupToken.mint(params.groupAddress, amountAtto);
-  });
-}
-
-export async function buildCreateGroupAction(params: {
-  actorAddress: Address;
-  groupName: string;
-  groupDescription: string;
-  groupImageUrl: string;
-}): Promise<Array<{ to: string; data: `0x${string}`; value: `0x${string}` }>> {
-  const groupName = params.groupName.trim();
-  if (!groupName) {
-    throw new Error("groupName is required.");
-  }
-
-  if (groupName.length > 19) {
-    throw new Error("Group name must be 19 characters or fewer.");
-  }
-
-  const symbol = createGroupSymbol(groupName);
-
-  return collectHostTransactions(params.actorAddress, async (sdk) => {
-    const sdkWithInternals = sdk as unknown as {
-      core?: {
-        referralsModule?: {
-          computeAddress?: (signer: Address) => Promise<Address>;
-          createAccount?: (signer: Address) => TransactionRequest;
-        };
-        baseGroupFactory?: {
-          createBaseGroup: (
-            owner: Address,
-            service: Address,
-            feeCollection: Address,
-            initialConditions: Address[],
-            name: string,
-            symbol: string,
-            metadataDigest: `0x${string}`
-          ) => TransactionRequest;
-        };
-      };
-    };
-
-    const profileCreator = sdk.profiles?.create;
-    const referralsModule = sdkWithInternals.core?.referralsModule;
-    const baseGroupFactory = sdkWithInternals.core?.baseGroupFactory;
-
-    if (!profileCreator || !referralsModule?.computeAddress || !referralsModule?.createAccount || !baseGroupFactory?.createBaseGroup) {
-      throw new Error("SDK does not expose required group creation internals in this environment.");
-    }
-
-    const profile = {
-      name: groupName,
-      description: params.groupDescription.trim(),
-      imageUrl: params.groupImageUrl.trim(),
-      previewImageUrl: params.groupImageUrl.trim()
-    };
-
-    const profileCid = await profileCreator(profile);
-    const metadataDigest = cidV0ToHex(profileCid) as `0x${string}`;
-    const safeAddress = await referralsModule.computeAddress(params.actorAddress);
-
-    const publicClient = createPublicClient({
-      chain: gnosis,
-      transport: http(chainRpcUrl())
-    });
-    const safeCode = await publicClient.getCode({ address: safeAddress });
-
-    const txs: TransactionRequest[] = [];
-    if (!safeCode || safeCode === "0x") {
-      txs.push(referralsModule.createAccount(params.actorAddress));
-    }
-
-    txs.push(
-      baseGroupFactory.createBaseGroup(
-        safeAddress,
-        safeAddress,
-        safeAddress,
-        [],
-        groupName,
-        symbol,
-        metadataDigest
-      )
-    );
-
-    return txs;
   });
 }

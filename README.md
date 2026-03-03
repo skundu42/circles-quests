@@ -1,15 +1,16 @@
-# Circles Quest App
+# Circles Daily Quest App
 
 A Circles quests/task-completion app with in-app actions and server-side verification.
 
 ## Active Quests
 
 1. Add trust (search + pick a Circles user)
-2. Have more than 3 mutual trusts
+2. Have more than 10 mutual trusts (+10 XP for every 20 extra mutual trusts)
 3. Send more than 5 CRC to any Circles avatar
-4. Mint 5 gCRC for group `0xc19bc204eb1c1d5b3fe500e5e5dfabab625f286c`
-5. Create a group (name, description, image)
+4. Hold at least 5000 CRC (+20 XP for every extra 1000 CRC)
+5. Mint 5 gCRC for group `0xc19bc204eb1c1d5b3fe500e5e5dfabab625f286c`
 6. Validate you trust no blacklisted address
+7. true bUilder: be an active member of group `0x4e2564e5df6c1fb10c1a018538de36e4d5844de5`
 
 ## Core Flow
 
@@ -43,8 +44,13 @@ A Circles quests/task-completion app with in-app actions and server-side verific
 - `QUEST_MIN_CONFIRMATIONS`
 - `QUEST_SEND_MIN_CRC`
 - `QUEST_SEND_EXECUTION_CRC`
+- `QUEST_MUTUAL_TRUST_MIN`
+- `QUEST_MUTUAL_TRUST_BONUS_EVERY`
+- `QUEST_MUTUAL_TRUST_BONUS_XP`
+- `QUEST_HOLDINGS_MIN_CRC`
+- `QUEST_HOLDINGS_BONUS_EVERY_CRC`
+- `QUEST_HOLDINGS_BONUS_XP`
 - `QUEST_GCRC_MINT_AMOUNT_CRC`
-- `QUEST_GROUP_IMAGE_MAX_INPUT_CHARS` (optional, default: `700000`)
 
 ## Supabase Setup (Required)
 

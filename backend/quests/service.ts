@@ -10,7 +10,7 @@ import {
   verifyTxAfterRoundStart
 } from "@backend/quests/chain";
 import { getCompletionByQuest, listCompletionsByDate, listCompletionsByDateAddress, upsertCompletion } from "./store";
-import { buildAddTrustAction, buildCreateGroupAction, buildJoinGroupAction, buildPaymentAction } from "./tx-builder";
+import { buildAddTrustAction, buildJoinGroupAction, buildPaymentAction } from "./tx-builder";
 import type {
   PreparedQuestAction,
   QuestCompletion,
@@ -26,13 +26,19 @@ const MIN_CONFIRMATIONS = Number(process.env.QUEST_MIN_CONFIRMATIONS || "1");
 
 const SEND_MIN_CRC = process.env.QUEST_SEND_MIN_CRC || "5";
 const SEND_EXECUTION_CRC = process.env.QUEST_SEND_EXECUTION_CRC || "5.1";
+const MUTUAL_TRUST_MIN = Number(process.env.QUEST_MUTUAL_TRUST_MIN || "10");
+const MUTUAL_TRUST_BONUS_EVERY = Number(process.env.QUEST_MUTUAL_TRUST_BONUS_EVERY || "20");
+const MUTUAL_TRUST_BONUS_XP = Number(process.env.QUEST_MUTUAL_TRUST_BONUS_XP || "10");
+const HOLDINGS_MIN_CRC = process.env.QUEST_HOLDINGS_MIN_CRC || "5000";
+const HOLDINGS_BONUS_EVERY_CRC = process.env.QUEST_HOLDINGS_BONUS_EVERY_CRC || "1000";
+const HOLDINGS_BONUS_XP = Number(process.env.QUEST_HOLDINGS_BONUS_XP || "20");
 const GCRC_MINT_AMOUNT_CRC = process.env.QUEST_GCRC_MINT_AMOUNT_CRC || "5";
 const GCRC_GROUP_ADDRESS = "0xc19bc204eb1c1d5b3fe500e5e5dfabab625f286c" as Address;
+const TRUE_BUILDER_GROUP_ADDRESS = "0x4e2564e5df6c1fb10c1a018538de36e4d5844de5" as Address;
 
 const BLACKLIST_API_URL =
   "https://squid-app-3gxnl.ondigitalocean.app/aboutcircles-advanced-analytics2/bot-analytics/blacklist?include_reason=false&v2_only=true";
 const BLACKLIST_CACHE_TTL_MS = 5 * 60 * 1000;
-const GROUP_IMAGE_MAX_INPUT_CHARS = Number(process.env.QUEST_GROUP_IMAGE_MAX_INPUT_CHARS || "700000");
 
 let blacklistCache: { expiresAt: number; addresses: Set<string> } | null = null;
 
@@ -54,8 +60,8 @@ const QUESTS: QuestDefinition[] = [
   },
   {
     id: "mutual-trust-3plus",
-    title: "More Than 3 Mutual Trusts",
-    description: "Have more than 3 mutual trust relationships.",
+    title: "More Than 10 Mutual Trusts",
+    description: `Have more than ${MUTUAL_TRUST_MIN} mutual trust relationships. Earn +${MUTUAL_TRUST_BONUS_XP} XP for every ${MUTUAL_TRUST_BONUS_EVERY} extra mutual trusts.`,
     xp: 120,
     inputFields: []
   },
@@ -71,8 +77,22 @@ const QUESTS: QuestDefinition[] = [
         type: "address",
         placeholder: "0x...",
         required: true
+      },
+      {
+        id: "amountCRC",
+        label: "Amount (CRC)",
+        type: "amount",
+        placeholder: "5.1",
+        required: true
       }
     ]
+  },
+  {
+    id: "holdings-threshold",
+    title: "Holdings Threshold",
+    description: `Hold at least ${HOLDINGS_MIN_CRC} CRC in total balance. Earn +${HOLDINGS_BONUS_XP} XP for every extra ${HOLDINGS_BONUS_EVERY_CRC} CRC.`,
+    xp: 130,
+    inputFields: []
   },
   {
     id: "mint-5-gcrc",
@@ -82,39 +102,17 @@ const QUESTS: QuestDefinition[] = [
     inputFields: []
   },
   {
-    id: "create-group",
-    title: "Create a Group",
-    description: "Create a new group with name, description, and image.",
-    xp: 190,
-    inputFields: [
-      {
-        id: "groupName",
-        label: "Group Name",
-        type: "text",
-        placeholder: "Builders Guild",
-        required: true
-      },
-      {
-        id: "groupDescription",
-        label: "Description",
-        type: "text",
-        placeholder: "What the group is about",
-        required: true
-      },
-      {
-        id: "groupImageUrl",
-        label: "Group Image",
-        type: "image",
-        placeholder: "Upload group image",
-        required: true
-      }
-    ]
-  },
-  {
     id: "no-blacklisted-trusts",
     title: "No Blacklisted Trusts",
     description: "Verify you currently trust no blacklisted addresses.",
     xp: 150,
+    inputFields: []
+  },
+  {
+    id: "true-builder",
+    title: "True builder",
+    description: `Verify you are currently a member of group Open Internet Club.`,
+    xp: 170,
     inputFields: []
   }
 ];
@@ -123,9 +121,10 @@ const QUEST_ORDER: QuestId[] = [
   "add-trust",
   "mutual-trust-3plus",
   "send-5-crc",
+  "holdings-threshold",
   "mint-5-gcrc",
-  "create-group",
-  "no-blacklisted-trusts"
+  "no-blacklisted-trusts",
+  "true-builder"
 ];
 
 export class QuestError extends Error {
@@ -184,40 +183,115 @@ function parseAmountCRC(raw: unknown, fallback: string): string {
   return value;
 }
 
-function isValidGroupImageInput(value: string): boolean {
-  if (!value) {
-    return false;
+function requiresOnchainProof(questId: QuestId): boolean {
+  return questId === "add-trust" || questId === "send-5-crc" || questId === "mint-5-gcrc";
+}
+
+function parseOptionalNonNegativeInteger(value: unknown): number | null {
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim().length > 0
+        ? Number(value)
+        : NaN;
+
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
   }
 
-  if (value.length > GROUP_IMAGE_MAX_INPUT_CHARS) {
-    return false;
+  return Math.floor(parsed);
+}
+
+function parseOptionalBigInt(value: unknown): bigint | null {
+  if (typeof value === "bigint") {
+    return value >= 0n ? value : null;
   }
 
-  const lower = value.toLowerCase();
-  if (lower.startsWith("https://") || lower.startsWith("http://") || lower.startsWith("ipfs://")) {
-    try {
-      new URL(value);
-      return true;
-    } catch {
-      return false;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) {
+      return null;
+    }
+
+    return BigInt(Math.floor(value));
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    if (!/^\d+$/.test(trimmed)) {
+      return null;
+    }
+
+    return BigInt(trimmed);
+  }
+
+  return null;
+}
+
+function getMutualTrustBonusXp(mutualTrustCount: number): number {
+  const threshold = Math.max(0, MUTUAL_TRUST_MIN);
+  if (mutualTrustCount <= threshold) {
+    return 0;
+  }
+
+  const extra = mutualTrustCount - threshold;
+  const every = Math.max(1, MUTUAL_TRUST_BONUS_EVERY);
+  const bonusPerStep = Math.max(0, MUTUAL_TRUST_BONUS_XP);
+  const steps = Math.floor(extra / every);
+
+  return steps * bonusPerStep;
+}
+
+function getHoldingsBonusXp(totalBalanceAtto: bigint): number {
+  const minAtto = parseUnits(HOLDINGS_MIN_CRC, 18);
+  if (totalBalanceAtto <= minAtto) {
+    return 0;
+  }
+
+  const extraAtto = totalBalanceAtto - minAtto;
+  const stepAtto = parseUnits(HOLDINGS_BONUS_EVERY_CRC, 18);
+  const safeStepAtto = stepAtto > 0n ? stepAtto : 1n;
+  const bonusPerStep = Math.max(0, HOLDINGS_BONUS_XP);
+  if (bonusPerStep === 0) {
+    return 0;
+  }
+
+  const steps = extraAtto / safeStepAtto;
+  const maxSteps = BigInt(Math.floor(Number.MAX_SAFE_INTEGER / bonusPerStep));
+  const clampedSteps = steps > maxSteps ? maxSteps : steps;
+
+  return Number(clampedSteps) * bonusPerStep;
+}
+
+function getCompletionAwardedXp(quest: QuestDefinition, completion?: QuestCompletion): number {
+  if (!completion || completion.status !== "verified") {
+    return 0;
+  }
+
+  const proof = completion.proof ?? {};
+  const explicitAwardedXp = parseOptionalNonNegativeInteger(proof.awardedXp);
+  if (explicitAwardedXp !== null) {
+    return explicitAwardedXp;
+  }
+
+  if (quest.id === "mutual-trust-3plus") {
+    const mutualTrustCount = parseOptionalNonNegativeInteger(proof.mutualTrustCount);
+    if (mutualTrustCount !== null) {
+      return quest.xp + getMutualTrustBonusXp(mutualTrustCount);
     }
   }
 
-  return /^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]+$/i.test(value);
-}
+  if (quest.id === "holdings-threshold") {
+    const totalBalanceAtto = parseOptionalBigInt(proof.totalBalanceAttoCircles);
+    if (totalBalanceAtto !== null) {
+      return quest.xp + getHoldingsBonusXp(totalBalanceAtto);
+    }
+  }
 
-async function getSignerSafeAddress(signer: Address): Promise<Address> {
-  const core = getCore();
-  return core.referralsModule.computeAddress(signer);
-}
-
-function requiresOnchainProof(questId: QuestId): boolean {
-  return (
-    questId === "add-trust" ||
-    questId === "send-5-crc" ||
-    questId === "mint-5-gcrc" ||
-    questId === "create-group"
-  );
+  return quest.xp;
 }
 
 function mapQuestStatus(params: {
@@ -240,6 +314,7 @@ function mapQuestStatus(params: {
   if (completion.status === "verified") {
     return {
       ...quest,
+      xp: getCompletionAwardedXp(quest, completion),
       status: "completed",
       unlockWeekday,
       isUnlockedToday,
@@ -304,15 +379,161 @@ export async function getTodayQuests(address?: string): Promise<TodayQuestsPaylo
 }
 
 async function verifyAddTrust(address: Address, targetAddress: Address): Promise<boolean> {
+  const core = getCore();
+  try {
+    return await core.hubV2.isTrusted(address, targetAddress);
+  } catch {
+    // Fallback to RPC-derived trust graph if direct chain read fails.
+    const rpc = getRpc();
+    const trusts = await rpc.trust.getTrusts(address);
+    const mutuals = await rpc.trust.getMutualTrusts(address);
+    const candidates = [...trusts, ...mutuals];
+    return candidates.some((relation) => normalizeAddress(relation.objectAvatar) === normalizeAddress(targetAddress));
+  }
+}
+
+async function findTrustRelationForQuest(params: {
+  txHash: string;
+  trusterAddress: Address;
+  trusteeAddress: Address;
+  startAt: string;
+}): Promise<{ blockNumber: number; timestamp: number } | null> {
   const rpc = getRpc();
-  const trusts = await rpc.trust.getTrusts(address);
-  return trusts.some((relation) => normalizeAddress(relation.objectAvatar) === normalizeAddress(targetAddress));
+  const query = rpc.trust.getTrustRelations(params.trusterAddress, 100, "DESC");
+  const minTimestamp = Math.floor(Date.parse(params.startAt) / 1000);
+
+  let scanned = 0;
+  while (scanned < 10 && (await query.queryNextPage())) {
+    scanned += 1;
+    const rows = (query.currentPage?.results ?? []) as Array<{
+      blockNumber: number;
+      timestamp: number;
+      transactionHash: string;
+      truster: string;
+      trustee: string;
+    }>;
+
+    for (const row of rows) {
+      if (normalizeAddress(row.transactionHash) !== normalizeAddress(params.txHash)) {
+        continue;
+      }
+
+      if (Number(row.timestamp) < minTimestamp) {
+        continue;
+      }
+
+      if (normalizeAddress(row.truster) !== normalizeAddress(params.trusterAddress)) {
+        continue;
+      }
+
+      if (normalizeAddress(row.trustee) !== normalizeAddress(params.trusteeAddress)) {
+        continue;
+      }
+
+      return {
+        blockNumber: Number(row.blockNumber),
+        timestamp: Number(row.timestamp)
+      };
+    }
+
+    if (!query.currentPage?.hasMore) {
+      break;
+    }
+  }
+
+  return null;
+}
+
+async function wasAlreadyTrustedBeforeTx(params: {
+  txHash: string;
+  trusterAddress: Address;
+  trusteeAddress: Address;
+  txBlockNumber: number;
+  txTransactionIndex: number;
+  txTimestamp: number;
+}): Promise<{
+  alreadyTrusted: boolean;
+  previousRelation: { blockNumber: number; timestamp: number; expiryTime: string; transactionHash: string } | null;
+}> {
+  const rpc = getRpc();
+  const query = rpc.trust.getTrustRelations(params.trusterAddress, 100, "DESC");
+
+  let scanned = 0;
+  while (scanned < 20 && (await query.queryNextPage())) {
+    scanned += 1;
+    const rows = (query.currentPage?.results ?? []) as Array<{
+      blockNumber: number;
+      timestamp: number;
+      transactionIndex: number;
+      transactionHash: string;
+      truster: string;
+      trustee: string;
+      expiryTime: string | number;
+    }>;
+
+    for (const row of rows) {
+      if (normalizeAddress(row.truster) !== normalizeAddress(params.trusterAddress)) {
+        continue;
+      }
+
+      if (normalizeAddress(row.trustee) !== normalizeAddress(params.trusteeAddress)) {
+        continue;
+      }
+
+      if (normalizeAddress(row.transactionHash) === normalizeAddress(params.txHash)) {
+        continue;
+      }
+
+      const rowBlock = Number(row.blockNumber);
+      const rowTxIndex = Number(row.transactionIndex);
+      const rowTimestamp = Number(row.timestamp);
+
+      const isBeforeByBlock =
+        rowBlock < params.txBlockNumber ||
+        (rowBlock === params.txBlockNumber && rowTxIndex < params.txTransactionIndex);
+
+      if (!isBeforeByBlock) {
+        continue;
+      }
+
+      if (rowTimestamp > params.txTimestamp) {
+        continue;
+      }
+
+      const expiryTime = BigInt(row.expiryTime);
+      const wasActive = expiryTime > BigInt(params.txTimestamp);
+
+      return {
+        alreadyTrusted: wasActive,
+        previousRelation: {
+          blockNumber: rowBlock,
+          timestamp: rowTimestamp,
+          expiryTime: expiryTime.toString(),
+          transactionHash: normalizeAddress(row.transactionHash)
+        }
+      };
+    }
+
+    if (!query.currentPage?.hasMore) {
+      break;
+    }
+  }
+
+  return {
+    alreadyTrusted: false,
+    previousRelation: null
+  };
 }
 
 async function getMutualTrustCount(address: Address): Promise<number> {
   const rpc = getRpc();
   const mutuals = await rpc.trust.getMutualTrusts(address);
   return mutuals.length;
+}
+
+async function getTotalHoldingsAtto(address: Address): Promise<bigint> {
+  const rpc = getRpc();
+  return rpc.balance.getTotalBalance(address, true);
 }
 
 async function findTransferForQuest(params: {
@@ -417,42 +638,39 @@ async function verifyJoinedGroupSinceStart(params: {
   return false;
 }
 
-async function verifyGroupCreatedSinceStart(params: {
-  ownerAddress: Address;
-  startAt: string;
-  txHash: string;
-  expectedName?: string;
-}): Promise<{ ok: boolean; groupAddress?: string; name?: string }> {
+async function verifyCurrentGroupMembership(params: {
+  memberAddress: Address;
+  groupAddress: Address;
+}): Promise<{ isMember: boolean; expiryTime: number | null }> {
   const rpc = getRpc();
-  const startTimestamp = Math.floor(Date.parse(params.startAt) / 1000);
-  const groups = await rpc.group.findGroups(100, {
-    ownerIn: [params.ownerAddress]
-  });
+  const now = Math.floor(Date.now() / 1000);
+  const query = rpc.group.getGroupMemberships(params.memberAddress, 100, "DESC");
 
-  const matched = groups.find((group) => {
-    if (Number(group.timestamp) < startTimestamp) {
-      return false;
+  let scanned = 0;
+  while (scanned < 10 && (await query.queryNextPage())) {
+    scanned += 1;
+    const rows = query.currentPage?.results ?? [];
+
+    for (const row of rows) {
+      if (normalizeAddress(row.group) !== normalizeAddress(params.groupAddress)) {
+        continue;
+      }
+
+      const expiryTime = Number(row.expiryTime);
+      return {
+        isMember: Number.isFinite(expiryTime) ? expiryTime > now : false,
+        expiryTime: Number.isFinite(expiryTime) ? expiryTime : null
+      };
     }
 
-    if (normalizeAddress(group.transactionHash) !== normalizeAddress(params.txHash)) {
-      return false;
+    if (!query.currentPage?.hasMore) {
+      break;
     }
-
-    if (params.expectedName && String(group.name || "").trim() !== params.expectedName) {
-      return false;
-    }
-
-    return true;
-  });
-
-  if (!matched) {
-    return { ok: false };
   }
 
   return {
-    ok: true,
-    groupAddress: matched.group,
-    name: matched.name
+    isMember: false,
+    expiryTime: null
   };
 }
 
@@ -533,6 +751,32 @@ function readInput(input: Record<string, unknown> | undefined, key: string): str
   return String(value ?? "").trim();
 }
 
+function parseCandidateTxHashes(params: { txHash?: string; txHashes?: string[] }): string[] {
+  const candidates = [
+    String(params.txHash ?? "").trim(),
+    ...((params.txHashes ?? []).map((value) => String(value ?? "").trim()))
+  ];
+
+  const unique = new Set<string>();
+  const out: string[] = [];
+
+  for (const candidate of candidates) {
+    if (!candidate || !candidate.startsWith("0x")) {
+      continue;
+    }
+
+    const normalized = normalizeAddress(candidate);
+    if (unique.has(normalized)) {
+      continue;
+    }
+
+    unique.add(normalized);
+    out.push(normalized);
+  }
+
+  return out;
+}
+
 function humanizeVerificationError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message.toLowerCase();
@@ -572,6 +816,11 @@ export async function prepareQuestAction(params: {
 
   if (quest.id === "add-trust") {
     const targetAddress = validateAddress(readInput(params.input, "targetAddress"), "targetAddress");
+    const alreadyTrusted = await verifyAddTrust(address, targetAddress);
+    if (alreadyTrusted) {
+      throw new QuestError("You already trust this address. Pick someone you do not currently trust.", 400);
+    }
+
     return {
       questId: quest.id,
       summary: `Add trust to ${targetAddress}`,
@@ -612,6 +861,14 @@ export async function prepareQuestAction(params: {
     };
   }
 
+  if (quest.id === "holdings-threshold") {
+    return {
+      questId: quest.id,
+      summary: `No transaction needed. We will verify your total balance is at least ${HOLDINGS_MIN_CRC} CRC.`,
+      hostTransactions: []
+    };
+  }
+
   if (quest.id === "mint-5-gcrc") {
     return {
       questId: quest.id,
@@ -624,50 +881,18 @@ export async function prepareQuestAction(params: {
     };
   }
 
-  if (quest.id === "create-group") {
-    const groupName = readInput(params.input, "groupName");
-    const groupDescription = readInput(params.input, "groupDescription");
-    const groupImageUrl = readInput(params.input, "groupImageUrl");
-
-    if (!groupName) {
-      throw new QuestError("groupName is required", 400);
-    }
-
-    if (groupName.length > 19) {
-      throw new QuestError("Group name must be 19 characters or fewer", 400);
-    }
-
-    if (!groupDescription) {
-      throw new QuestError("groupDescription is required", 400);
-    }
-
-    if (!groupImageUrl) {
-      throw new QuestError("groupImageUrl is required", 400);
-    }
-
-    if (!isValidGroupImageInput(groupImageUrl)) {
-      throw new QuestError(
-        "groupImageUrl must be a valid image URL (http/https/ipfs) or uploaded image payload",
-        400
-      );
-    }
-
-    return {
-      questId: quest.id,
-      summary: `Deploy Safe + create group \"${groupName}\"`,
-      hostTransactions: await buildCreateGroupAction({
-        actorAddress: address,
-        groupName,
-        groupDescription,
-        groupImageUrl
-      })
-    };
-  }
-
   if (quest.id === "no-blacklisted-trusts") {
     return {
       questId: quest.id,
       summary: "No transaction needed. We will verify trusted addresses against the blacklist.",
+      hostTransactions: []
+    };
+  }
+
+  if (quest.id === "true-builder") {
+    return {
+      questId: quest.id,
+      summary: `No transaction needed. We will verify membership in ${TRUE_BUILDER_GROUP_ADDRESS}.`,
       hostTransactions: []
     };
   }
@@ -679,15 +904,20 @@ export async function claimQuest(params: {
   address: string;
   questId: string;
   txHash?: string;
+  txHashes?: string[];
   input?: Record<string, unknown>;
 }): Promise<{ completion: QuestCompletion; payload: TodayQuestsPayload }> {
   const address = validateAddress(params.address, "address");
   const quest = getQuestOrThrow(params.questId);
   const window = getRoundWindow();
-  const txHash = String(params.txHash || "").trim();
+  const candidateTxHashes = parseCandidateTxHashes({
+    txHash: params.txHash,
+    txHashes: params.txHashes
+  });
+  const txHash = candidateTxHashes[0] ?? "";
   const needsTx = requiresOnchainProof(quest.id);
 
-  if (needsTx && (!txHash || !txHash.startsWith("0x"))) {
+  if (needsTx && !candidateTxHashes.length) {
     throw new QuestError("txHash is required", 400);
   }
 
@@ -702,33 +932,71 @@ export async function claimQuest(params: {
   let verified = false;
   let reason = "Verification failed";
   let proof: Record<string, unknown> = {};
+  let verifiedTx: Awaited<ReturnType<typeof verifyTxAfterRoundStart>> | null = null;
+  let completionTxHash = txHash;
 
   try {
-    if (needsTx) {
-      const tx = await verifyTxAfterRoundStart({
+    if (needsTx && quest.id !== "mint-5-gcrc") {
+      verifiedTx = await verifyTxAfterRoundStart({
         txHash,
         expectedFrom: address,
         roundStartAt: window.startAt,
         minConfirmations: MIN_CONFIRMATIONS
       });
 
-      proof.tx = tx;
+      proof.tx = verifiedTx;
     }
 
     if (quest.id === "add-trust") {
       const targetAddress = validateAddress(readInput(params.input, "targetAddress"), "targetAddress");
-      verified = await verifyAddTrust(address, targetAddress);
-      reason = verified ? "ok" : "Trust edge does not exist yet";
+      if (!verifiedTx) {
+        throw new Error("Transaction verification missing");
+      }
+
+      const priorTrustState = await wasAlreadyTrustedBeforeTx({
+        txHash,
+        trusterAddress: address,
+        trusteeAddress: targetAddress,
+        txBlockNumber: verifiedTx.blockNumber,
+        txTransactionIndex: verifiedTx.transactionIndex,
+        txTimestamp: verifiedTx.blockTimestamp
+      });
+      const trustRelation = await findTrustRelationForQuest({
+        txHash,
+        trusterAddress: address,
+        trusteeAddress: targetAddress,
+        startAt: window.startAt
+      });
+      const trustExists = await verifyAddTrust(address, targetAddress);
+
+      verified = !priorTrustState.alreadyTrusted && Boolean(trustRelation) && trustExists;
+      if (priorTrustState.alreadyTrusted) {
+        reason = "You already trusted this address before this transaction.";
+      } else if (!trustRelation) {
+        reason = "No matching trust action for this transaction was found";
+      } else if (!trustExists) {
+        reason = "Trust edge does not exist yet";
+      } else {
+        reason = "ok";
+      }
+
       proof.targetAddress = targetAddress;
+      proof.priorTrustState = priorTrustState;
+      proof.trustRelation = trustRelation;
     } else if (quest.id === "mutual-trust-3plus") {
       const count = await getMutualTrustCount(address);
-      verified = count > 3;
-      reason = verified ? "ok" : "Need more than 3 mutual trusts";
+      verified = count > MUTUAL_TRUST_MIN;
+      reason = verified ? "ok" : `Need more than ${MUTUAL_TRUST_MIN} mutual trusts`;
+      const bonusXp = verified ? getMutualTrustBonusXp(count) : 0;
       proof.mutualTrustCount = count;
+      proof.baseXp = quest.xp;
+      proof.bonusXp = bonusXp;
+      proof.awardedXp = verified ? quest.xp + bonusXp : 0;
     } else if (quest.id === "send-5-crc") {
       const recipientAddress = validateAddress(readInput(params.input, "recipientAddress"), "recipientAddress");
       const transfer = await findTransferForQuest({
         txHash,
+        fromAddress: address,
         recipientAddress,
         startAt: window.startAt
       });
@@ -748,58 +1016,100 @@ export async function claimQuest(params: {
         proof.transferAmountAttoCircles = amountAtto.toString();
         proof.minRequiredAttoCircles = minAtto.toString();
       }
+    } else if (quest.id === "holdings-threshold") {
+      const totalAtto = await getTotalHoldingsAtto(address);
+      const minAtto = parseUnits(HOLDINGS_MIN_CRC, 18);
+      verified = totalAtto >= minAtto;
+      reason = verified ? "ok" : `Hold at least ${HOLDINGS_MIN_CRC} CRC to complete this quest`;
+      const bonusXp = verified ? getHoldingsBonusXp(totalAtto) : 0;
+      proof.totalBalanceAttoCircles = totalAtto.toString();
+      proof.minRequiredAttoCircles = minAtto.toString();
+      proof.baseXp = quest.xp;
+      proof.bonusXp = bonusXp;
+      proof.awardedXp = verified ? quest.xp + bonusXp : 0;
     } else if (quest.id === "mint-5-gcrc") {
-      const transfer = await findTransferForQuestToken({
-        txHash,
-        recipientAddress: address,
-        tokenAddress: GCRC_GROUP_ADDRESS,
-        startAt: window.startAt
-      });
+      const minAtto = parseUnits(GCRC_MINT_AMOUNT_CRC, 18);
+      let matchedTransfer:
+        | {
+            txHash: string;
+            source: "rpc_history";
+            amountAtto: bigint;
+            transferTimestamp?: number;
+            transferBlockNumber?: number;
+            transferFrom?: string;
+            transferTo?: string;
+          }
+        | null = null;
+      let lastFailureReason = "No qualifying gCRC mint transfer found for this transaction";
 
-      if (!transfer) {
-        reason = "No qualifying gCRC mint transfer found for this transaction";
-      } else {
-        const amountAtto = transfer.attoCircles ?? BigInt(transfer.value);
-        const minAtto = parseUnits(GCRC_MINT_AMOUNT_CRC, 18);
-
-        const joinedGroup = await verifyJoinedGroupSinceStart({
-          memberAddress: address,
-          groupAddress: GCRC_GROUP_ADDRESS,
-          startAt: window.startAt,
-          expectedTxHash: txHash
-        });
-
-        verified = amountAtto >= minAtto && joinedGroup;
-
-        if (!joinedGroup) {
-          reason = "Group membership for the required gCRC group was not found in this round";
-        } else if (amountAtto < minAtto) {
-          reason = `Mint amount is below ${GCRC_MINT_AMOUNT_CRC} gCRC`;
-        } else {
-          reason = "ok";
+      for (const candidateHash of candidateTxHashes) {
+        let candidateVerifiedTx: Awaited<ReturnType<typeof verifyTxAfterRoundStart>>;
+        try {
+          candidateVerifiedTx = await verifyTxAfterRoundStart({
+            txHash: candidateHash,
+            expectedFrom: address,
+            roundStartAt: window.startAt,
+            minConfirmations: MIN_CONFIRMATIONS
+          });
+        } catch (error) {
+          lastFailureReason = humanizeVerificationError(error);
+          continue;
         }
 
-        proof.groupAddress = GCRC_GROUP_ADDRESS;
-        proof.transferTokenAddress = transfer.tokenAddress;
-        proof.transferAmountAttoCircles = amountAtto.toString();
-        proof.minRequiredAttoCircles = minAtto.toString();
-        proof.joinedGroup = joinedGroup;
-      }
-    } else if (quest.id === "create-group") {
-      const expectedName = readInput(params.input, "groupName");
-      const expectedOwner = await getSignerSafeAddress(address);
-      const creation = await verifyGroupCreatedSinceStart({
-        ownerAddress: expectedOwner,
-        startAt: window.startAt,
-        txHash,
-        expectedName: expectedName || undefined
-      });
+        const transfer = await findTransferForQuestToken({
+          txHash: candidateHash,
+          recipientAddress: address,
+          tokenAddress: GCRC_GROUP_ADDRESS,
+          startAt: window.startAt
+        });
 
-      verified = creation.ok;
-      reason = verified ? "ok" : "Group creation not indexed yet or transaction does not match";
-      proof.groupOwner = expectedOwner;
-      proof.groupAddress = creation.groupAddress ?? null;
-      proof.groupName = creation.name ?? null;
+        if (transfer) {
+          const amountAtto = transfer.attoCircles ?? BigInt(transfer.value);
+          if (amountAtto < minAtto) {
+            lastFailureReason = `Mint amount is below ${GCRC_MINT_AMOUNT_CRC} gCRC`;
+            continue;
+          }
+
+          matchedTransfer = {
+            txHash: candidateHash,
+            source: "rpc_history",
+            amountAtto,
+            transferTimestamp: transfer.timestamp,
+            transferBlockNumber: transfer.blockNumber,
+            transferFrom: normalizeAddress(transfer.from),
+            transferTo: normalizeAddress(transfer.to)
+          };
+          verifiedTx = candidateVerifiedTx;
+          break;
+        }
+        lastFailureReason = "No qualifying gCRC mint transfer found for this transaction";
+      }
+
+      if (!matchedTransfer) {
+        reason = lastFailureReason;
+      } else {
+        verified = true;
+        reason = "ok";
+        completionTxHash = matchedTransfer.txHash;
+        proof.groupAddress = GCRC_GROUP_ADDRESS;
+        proof.transferTokenAddress = GCRC_GROUP_ADDRESS;
+        proof.transferSource = matchedTransfer.source;
+        proof.transferAmountAttoCircles = matchedTransfer.amountAtto.toString();
+        proof.minRequiredAttoCircles = minAtto.toString();
+        proof.matchedTxHash = matchedTransfer.txHash;
+        if (typeof matchedTransfer.transferTimestamp === "number") {
+          proof.transferTimestamp = matchedTransfer.transferTimestamp;
+        }
+        if (typeof matchedTransfer.transferBlockNumber === "number") {
+          proof.transferBlockNumber = matchedTransfer.transferBlockNumber;
+        }
+        if (matchedTransfer.transferFrom) {
+          proof.transferFrom = matchedTransfer.transferFrom;
+        }
+        if (matchedTransfer.transferTo) {
+          proof.transferTo = matchedTransfer.transferTo;
+        }
+      }
     } else if (quest.id === "no-blacklisted-trusts") {
       const result = await verifyNoBlacklistedTrusts(address);
       verified = result.ok;
@@ -809,9 +1119,27 @@ export async function claimQuest(params: {
       proof.trustedCount = result.trustedCount;
       proof.blacklistSize = result.blacklistSize;
       proof.blacklistedMatches = result.blacklistedMatches;
+    } else if (quest.id === "true-builder") {
+      const membership = await verifyCurrentGroupMembership({
+        memberAddress: address,
+        groupAddress: TRUE_BUILDER_GROUP_ADDRESS
+      });
+
+      verified = membership.isMember;
+      reason = verified
+        ? "ok"
+        : `You are not currently an active member of ${TRUE_BUILDER_GROUP_ADDRESS}`;
+      proof.groupAddress = TRUE_BUILDER_GROUP_ADDRESS;
+      proof.isMember = membership.isMember;
+      proof.expiryTime = membership.expiryTime;
     }
   } catch (error) {
     reason = humanizeVerificationError(error);
+  }
+
+  if (verified && parseOptionalNonNegativeInteger(proof.awardedXp) === null) {
+    proof.baseXp = quest.xp;
+    proof.awardedXp = quest.xp;
   }
 
   const completion = await upsertCompletion({
@@ -819,7 +1147,7 @@ export async function claimQuest(params: {
     address,
     questId: quest.id,
     status: verified ? "verified" : "rejected",
-    txHash: txHash ? normalizeAddress(txHash) : "0x",
+    txHash: completionTxHash ? normalizeAddress(completionTxHash) : "0x",
     input: params.input ?? {},
     proof,
     verifiedAt: verified ? new Date().toISOString() : undefined,
@@ -860,7 +1188,7 @@ async function resolveLeaderboardAvatarNames(addresses: string[]): Promise<Map<s
   }
 }
 
-export async function getTodayLeaderboard(limit: number = 20): Promise<QuestLeaderboardEntry[]> {
+export async function getTodayLeaderboard(limit: number = 10): Promise<QuestLeaderboardEntry[]> {
   const window = getRoundWindow();
   const completions = await listCompletionsByDate(window.date);
 
@@ -886,7 +1214,7 @@ export async function getTodayLeaderboard(limit: number = 20): Promise<QuestLead
 
     const bucket = buckets.get(key)!;
     bucket.completed += 1;
-    bucket.totalXp += quest.xp;
+    bucket.totalXp += getCompletionAwardedXp(quest, completion);
   }
 
   const ranked = Array.from(buckets.entries())
@@ -897,7 +1225,7 @@ export async function getTodayLeaderboard(limit: number = 20): Promise<QuestLead
       }
       return b.completed - a.completed;
     })
-    .slice(0, Math.max(1, limit));
+    .slice(0, Math.max(1, Math.min(10, limit)));
 
   const avatarNames = await resolveLeaderboardAvatarNames(ranked.map((item) => item.address));
 

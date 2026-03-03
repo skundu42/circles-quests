@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { CheckCircle2, Loader2, Trophy } from "lucide-react";
-import Image from "next/image";
 
 import type { QuestCompletion, QuestLeaderboardEntry, TodayQuestsPayload, UserQuestItem } from "@/types/quests";
 
@@ -120,26 +119,6 @@ function normalizeInputValue(value: string): string {
   return value.trim();
 }
 
-const MAX_GROUP_IMAGE_UPLOAD_BYTES = 350 * 1024;
-
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const value = typeof reader.result === "string" ? reader.result : "";
-      if (!value) {
-        reject(new Error("Could not read image file."));
-        return;
-      }
-      resolve(value);
-    };
-    reader.onerror = () => {
-      reject(new Error("Could not read image file."));
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
 export default function GamePage() {
   const [connectedAddress, setConnectedAddress] = useState<string | null>(null);
   const [token, setToken] = useState<string | null>(null);
@@ -154,6 +133,7 @@ export default function GamePage() {
   const [draftInputs, setDraftInputs] = useState<Record<string, Record<string, string>>>({});
   const [status, setStatus] = useState("Connect wallet in the host app.");
   const [error, setError] = useState<string | null>(null);
+  const [questDetailError, setQuestDetailError] = useState<string | null>(null);
   const [addressSearchFieldId, setAddressSearchFieldId] = useState<string | null>(null);
   const [addressSearchQuery, setAddressSearchQuery] = useState("");
   const [addressSearchResults, setAddressSearchResults] = useState<SearchUser[]>([]);
@@ -189,7 +169,7 @@ export default function GamePage() {
 
   const fetchLeaderboard = useCallback(async () => {
     try {
-      const response = await fetch("/api/quests/leaderboard/today?limit=20", {
+      const response = await fetch("/api/quests/leaderboard/today?limit=10", {
         cache: "no-store"
       });
       const payload = (await response.json()) as LeaderboardResponse;
@@ -376,6 +356,7 @@ export default function GamePage() {
     setAddressSearchQuery("");
     setAddressSearchResults([]);
     setAddressSearchError(null);
+    setQuestDetailError(null);
   }, [activeQuest?.id]);
 
   useEffect(() => {
@@ -443,6 +424,7 @@ export default function GamePage() {
 
     if (!token) {
       setStatus("Sign in with your wallet to execute quests.");
+      setQuestDetailError("Sign in with your wallet to execute quests.");
       return;
     }
 
@@ -452,6 +434,7 @@ export default function GamePage() {
 
     if (activeQuest.status === "completed") {
       setStatus("Quest already completed for today.");
+      setQuestDetailError("Quest already completed for today.");
       return;
     }
 
@@ -460,7 +443,7 @@ export default function GamePage() {
       const value = normalizeInputValue(activeDraft[field.id] ?? "");
 
       if (field.required && !value) {
-        setError(`${field.label} is required.`);
+        setQuestDetailError(`${field.label} is required.`);
         return;
       }
 
@@ -470,7 +453,7 @@ export default function GamePage() {
     }
 
     setRunningQuestId(activeQuest.id);
-    setError(null);
+    setQuestDetailError(null);
     setStatus(`Preparing ${activeQuest.title}...`);
 
     try {
@@ -491,9 +474,9 @@ export default function GamePage() {
       setStatus(preparePayload.action.summary);
 
       let txHash = "";
+      let txHashes: string[] = [];
       if (preparePayload.action.hostTransactions.length > 0) {
         const sdk = await loadSdk();
-        let txHashes: string[] = [];
         try {
           txHashes = await sdk.sendTransactions(preparePayload.action.hostTransactions);
         } catch (e) {
@@ -520,6 +503,7 @@ export default function GamePage() {
         },
         body: JSON.stringify({
           txHash: txHash || undefined,
+          txHashes: txHashes.length ? txHashes : undefined,
           input
         })
       });
@@ -532,15 +516,18 @@ export default function GamePage() {
       setQuestsPayload(claimPayload.result.payload);
 
       if (claimPayload.result.completion.status === "verified") {
+        setQuestDetailError(null);
         setStatus("Quest completed.");
       } else {
-        setStatus(`Quest failed: ${claimPayload.result.completion.rejectedReason || "Verification failed"}`);
+        const failureReason = claimPayload.result.completion.rejectedReason || "Verification failed";
+        setQuestDetailError(failureReason);
+        setStatus(`Quest failed: ${failureReason}`);
       }
 
       await fetchLeaderboard();
     } catch (e) {
       const message = e instanceof Error ? e.message : "Quest execution failed";
-      setError(message);
+      setQuestDetailError(message);
       setStatus("Quest execution failed.");
     } finally {
       setRunningQuestId(null);
@@ -554,7 +541,7 @@ export default function GamePage() {
           <div>
             <div>
               <div className="flex flex-wrap items-center gap-3">
-                <h1 className="font-display text-3xl text-ink md:text-4xl">Circles Quest App</h1>
+                <h1 className="font-display text-3xl text-ink md:text-4xl">Circles Daily Quest App</h1>
                 {questsPayload ? (
                   <div className="ml-auto inline-flex rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-emerald-700">
                     Loaded quests for {questsPayload.date}
@@ -586,6 +573,55 @@ export default function GamePage() {
               </div>
             </div>
           ) : null}
+        </section>
+
+        <section className="rounded-3xl border-2 border-marine/30 bg-gradient-to-br from-white via-white to-marine/5 p-5 shadow-[0_20px_50px_-28px_rgba(13,19,48,0.55)]">
+          <p className="inline-flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-ink/70">
+            <Trophy className="h-4 w-4 text-marine" />
+            Leaderboard
+          </p>
+          <div className="mt-3 space-y-2">
+            {leaderboard.length ? (
+              leaderboard.map((entry) => {
+                const rowTone =
+                  entry.rank === 1
+                    ? "border-amber-300 bg-amber-50/85"
+                    : entry.rank === 2
+                      ? "border-slate-300 bg-slate-50/90"
+                      : entry.rank === 3
+                        ? "border-orange-300 bg-orange-50/90"
+                        : "border-ink/10 bg-white";
+
+                const rankTone =
+                  entry.rank === 1
+                    ? "border-amber-400 bg-amber-200 text-amber-950"
+                    : entry.rank === 2
+                      ? "border-slate-400 bg-slate-200 text-slate-900"
+                      : entry.rank === 3
+                        ? "border-orange-400 bg-orange-200 text-orange-950"
+                        : "border-ink/20 bg-ink/5 text-ink";
+
+                return (
+                  <div key={`${entry.rank}-${entry.address}`} className={`rounded-2xl border px-3 py-2.5 text-xs ${rowTone}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2.5">
+                        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full border text-sm font-bold ${rankTone}`}>
+                          #{entry.rank}
+                        </div>
+                        <p className="truncate text-xs font-semibold text-ink">{entry.avatarName || "Unnamed Avatar"}</p>
+                      </div>
+                      <div className="ml-auto text-right">
+                        <p className="font-mono text-[11px] text-ink/65">{toShortAddress(entry.address)}</p>
+                        <p className="mt-1 text-ink/75">{entry.totalXp} XP • {entry.completed} quests completed</p>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            ) : (
+              <p className="text-sm text-ink/65">No entries yet.</p>
+            )}
+          </div>
         </section>
 
         <section className="grid gap-5 lg:grid-cols-[1.8fr_1fr]">
@@ -628,7 +664,7 @@ export default function GamePage() {
             </div>
           </div>
 
-          <div className="space-y-5">
+          <div>
             <div className="rounded-3xl border border-ink/15 bg-white/85 p-4">
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-ink/60">Quest Detail</p>
 
@@ -648,6 +684,12 @@ export default function GamePage() {
                       <p className="mt-1 text-red-600">Reason: {activeQuest.completion.rejectedReason || "Verification failed"}</p>
                     ) : null}
                   </div>
+
+                  {questDetailError ? (
+                    <p className="rounded-xl border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700">
+                      {questDetailError}
+                    </p>
+                  ) : null}
 
                   {!token ? (
                     <p className="rounded-xl border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs text-amber-800">
@@ -719,64 +761,18 @@ export default function GamePage() {
                       );
                     }
 
-                    if (field.type === "image") {
-                      const imageValue = activeDraft[field.id] ?? "";
-                      return (
-                        <div key={field.id} className="space-y-2 rounded-xl border border-ink/10 bg-white p-3">
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-ink/60">
-                            {field.label}
-                          </p>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            disabled={!token}
-                            onChange={(event) => {
-                              const file = event.target.files?.[0];
-                              if (!file || !activeQuest) {
-                                return;
-                              }
-
-                              if (file.size > MAX_GROUP_IMAGE_UPLOAD_BYTES) {
-                                setError("Image must be 350KB or smaller.");
-                                return;
-                              }
-
-                              setError(null);
-                              void readFileAsDataUrl(file)
-                                .then((dataUrl) => {
-                                  setDraftField(activeQuest.id, field.id, dataUrl);
-                                  setStatus("Group image uploaded.");
-                                })
-                                .catch((e: unknown) => {
-                                  const message = e instanceof Error ? e.message : "Could not read image.";
-                                  setError(message);
-                                });
-                            }}
-                            className="w-full rounded-xl border border-ink/15 bg-white px-3 py-2 text-xs text-ink/80 file:mr-3 file:rounded-lg file:border-0 file:bg-marine/10 file:px-2.5 file:py-1.5 file:text-[11px] file:font-semibold file:text-marine disabled:cursor-not-allowed disabled:opacity-60"
-                          />
-                          {imageValue ? (
-                            <Image
-                              src={imageValue}
-                              alt="Group preview"
-                              width={96}
-                              height={96}
-                              unoptimized
-                              className="h-24 w-24 rounded-lg border border-ink/10 object-cover"
-                            />
-                          ) : null}
-                        </div>
-                      );
-                    }
-
                     return (
                       <input
                         key={field.id}
-                        type={field.type === "url" ? "url" : "text"}
+                        type={field.type === "url" ? "url" : field.type === "amount" ? "number" : "text"}
                         value={activeDraft[field.id] ?? ""}
                         onChange={(event) => {
                           setDraftField(activeQuest.id, field.id, event.target.value);
                         }}
                         placeholder={field.placeholder || field.label}
+                        inputMode={field.type === "amount" ? "decimal" : undefined}
+                        min={field.type === "amount" ? "0" : undefined}
+                        step={field.type === "amount" ? "0.000000000000000001" : undefined}
                         disabled={!token}
                         className="w-full rounded-xl border border-ink/15 bg-white px-3 py-2 text-xs outline-none focus:border-marine/45 disabled:cursor-not-allowed disabled:opacity-60"
                       />
@@ -811,55 +807,6 @@ export default function GamePage() {
                   )}
                 </div>
               )}
-            </div>
-
-            <div className="rounded-3xl border-2 border-marine/30 bg-gradient-to-br from-white via-white to-marine/5 p-5 shadow-[0_20px_50px_-28px_rgba(13,19,48,0.55)]">
-              <p className="inline-flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.18em] text-ink/70">
-                <Trophy className="h-4 w-4 text-marine" />
-                Leaderboard
-              </p>
-              <div className="mt-3 space-y-2">
-                {leaderboard.length ? (
-                  leaderboard.map((entry) => {
-                    const rowTone =
-                      entry.rank === 1
-                        ? "border-amber-300 bg-amber-50/85"
-                        : entry.rank === 2
-                          ? "border-slate-300 bg-slate-50/90"
-                          : entry.rank === 3
-                            ? "border-orange-300 bg-orange-50/90"
-                            : "border-ink/10 bg-white";
-
-                    const rankTone =
-                      entry.rank === 1
-                        ? "border-amber-400 bg-amber-200 text-amber-950"
-                        : entry.rank === 2
-                          ? "border-slate-400 bg-slate-200 text-slate-900"
-                          : entry.rank === 3
-                            ? "border-orange-400 bg-orange-200 text-orange-950"
-                            : "border-ink/20 bg-ink/5 text-ink";
-
-                    return (
-                      <div key={`${entry.rank}-${entry.address}`} className={`rounded-2xl border px-3 py-2.5 text-xs ${rowTone}`}>
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="flex min-w-0 items-center gap-2.5">
-                            <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full border text-sm font-bold ${rankTone}`}>
-                              #{entry.rank}
-                            </div>
-                            <p className="truncate text-xs font-semibold text-ink">{entry.avatarName || "Unnamed Avatar"}</p>
-                          </div>
-                          <div className="ml-auto text-right">
-                            <p className="font-mono text-[11px] text-ink/65">{toShortAddress(entry.address)}</p>
-                            <p className="mt-1 text-ink/75">{entry.totalXp} XP • {entry.completed} quests completed</p>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })
-                ) : (
-                  <p className="text-sm text-ink/65">No entries yet.</p>
-                )}
-              </div>
             </div>
           </div>
         </section>

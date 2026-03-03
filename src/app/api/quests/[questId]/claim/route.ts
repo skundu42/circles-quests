@@ -15,6 +15,12 @@ export async function POST(
     const body = (await request.json()) as Record<string, unknown>;
 
     const txHash = String(body.txHash ?? "").trim();
+    const txHashes =
+      Array.isArray(body.txHashes)
+        ? body.txHashes
+            .map((value) => String(value ?? "").trim())
+            .filter((value) => value.length > 0)
+        : undefined;
 
     const input =
       body.input && typeof body.input === "object" && !Array.isArray(body.input)
@@ -25,6 +31,7 @@ export async function POST(
       address: auth.address,
       questId: params.questId,
       txHash,
+      txHashes,
       input
     });
 

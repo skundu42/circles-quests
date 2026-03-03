@@ -2,16 +2,17 @@ export type QuestId =
   | "add-trust"
   | "mutual-trust-3plus"
   | "send-5-crc"
+  | "holdings-threshold"
   | "mint-5-gcrc"
-  | "create-group"
-  | "no-blacklisted-trusts";
+  | "no-blacklisted-trusts"
+  | "true-builder";
 
 export type QuestStatus = "locked" | "available" | "completed" | "failed";
 
 export interface QuestInputField {
   id: string;
   label: string;
-  type: "address" | "amount" | "text" | "url" | "image";
+  type: "address" | "amount" | "text" | "url";
   placeholder?: string;
   required: boolean;
 }
